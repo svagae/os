@@ -1,0 +1,813 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define MEMORY_SIZE 60
+#define MAX_LINE_LENGTH 256
+#define MAX_QUEUE_SIZE 100
+#define MAX_NAME 50
+#define MAX_VALUE 256
+#define MAX_INSTRUCTIONS 50
+#define PCB_SIZE 5
+#define VAR_COUNT 3
+#define MAX_MUTEXES 10
+#define MAX_PROCESSES 10
+
+// Process states
+typedef enum {
+    READY,
+    RUNNING,
+    BLOCKED,
+    TERMINATED
+} ProcessState;
+
+// Memory word structure
+typedef struct {
+    char name[MAX_NAME];
+    char value[MAX_VALUE];
+} MemoryWord;
+
+// Memory system
+typedef struct {
+    MemoryWord words[MEMORY_SIZE];
+    int next_free;
+} Memory;
+
+// Process Control Block
+typedef struct {
+    int process_id;
+    ProcessState state;
+    int priority;
+    int program_counter;
+    int memory_lower;
+    int memory_upper;
+} PCB;
+
+typedef struct {
+    PCB pcb;
+    int instruction_start;
+    int variable_start;
+    int pcb_start;
+    int instruction_count;
+    int quantum_used;
+    int remaining_time;
+} Process;
+
+typedef struct QueueNode {
+    Process* process;
+    struct QueueNode* next;
+} QueueNode;
+
+typedef struct Queue {
+    QueueNode* front;
+    QueueNode* rear;
+} Queue;
+
+// Mutex controller
+typedef struct {
+    int locked[MAX_MUTEXES];
+    Queue blocked_queues[MAX_MUTEXES];
+    Queue general_blocked;
+} MutexController;
+
+// Simulation engine state
+typedef struct {
+    Memory* memory;
+    MutexController* mutex_ctrl;
+    Process** processes;
+    int process_count;
+    int algorithm; // 0: FCFS, 1: RR, 2: MLFQ
+    int quantum;
+    Queue ready_queues[4];
+    int clock_cycle;
+    int completed_processes;
+} SimulationEngine;
+
+// Initialize memory
+void init_memory(Memory* mem) {
+    for (int i = 0; i < MEMORY_SIZE; i++) {
+        mem->words[i].name[0] = '\0';
+        mem->words[i].value[0] = '\0';
+    }
+    mem->next_free = 0;
+}
+
+// Initialize queue
+void init_queue(Queue* queue) {
+    queue->front = NULL;
+    queue->rear = NULL;
+}
+
+// Enqueue process
+void enqueue(Queue* queue, Process* process) {
+    QueueNode* node = (QueueNode*)malloc(sizeof(QueueNode));
+    node->process = process;
+    node->next = NULL;
+
+    if (queue->rear == NULL) {
+        queue->front = queue->rear = node;
+    } else {
+        queue->rear->next = node;
+        queue->rear = node;
+    }
+}
+
+// Check if queue is empty
+int is_empty(Queue* queue) {
+    return queue->front == NULL;
+}
+
+// Dequeue process
+Process* dequeue(Queue* queue, int priority_based) {
+    if (queue->front == NULL) return NULL;
+
+    QueueNode* node = queue->front;
+    Process* proc = node->process;
+    queue->front = queue->front->next;
+
+    if (queue->front == NULL) {
+        queue->rear = NULL;
+    }
+
+    free(node);
+    return proc;
+}
+
+// Initialize mutex controller
+void init_mutex(MutexController* mutex_ctrl) {
+    for (int i = 0; i < MAX_MUTEXES; i++) {
+        mutex_ctrl->locked[i] = 0;
+        init_queue(&mutex_ctrl->blocked_queues[i]);
+    }
+    init_queue(&mutex_ctrl->general_blocked);
+}
+
+// Check memory boundaries
+int check_boundaries(Process* proc, int address) {
+    return address >= proc->pcb.memory_lower && address <= proc->pcb.memory_upper;
+}
+
+// Allocate memory
+int allocate_memory(Memory* mem, Process* proc, int instruction_count) {
+    int total_size = PCB_SIZE + VAR_COUNT + instruction_count;
+    if (mem->next_free + total_size > MEMORY_SIZE) {
+        printf("Error: Insufficient memory for process %d\n", proc->pcb.process_id);
+        return -1;
+    }
+
+    proc->pcb.memory_lower = mem->next_free;
+    proc->pcb_start = mem->next_free;
+    proc->variable_start = proc->pcb_start + PCB_SIZE;
+    proc->instruction_start = proc->variable_start + VAR_COUNT;
+    proc->pcb.memory_upper = proc->instruction_start + instruction_count - 1;
+    proc->instruction_count = instruction_count;
+
+    snprintf(mem->words[proc->pcb_start].name, MAX_NAME, "ProcessID");
+    snprintf(mem->words[proc->pcb_start].value, MAX_VALUE, "%d", proc->pcb.process_id);
+    snprintf(mem->words[proc->pcb_start + 1].name, MAX_NAME, "State");
+    snprintf(mem->words[proc->pcb_start + 1].value, MAX_VALUE, "Ready");
+    snprintf(mem->words[proc->pcb_start + 2].name, MAX_NAME, "Priority");
+    snprintf(mem->words[proc->pcb_start + 2].value, MAX_VALUE, "%d", proc->pcb.priority);
+    snprintf(mem->words[proc->pcb_start + 3].name, MAX_NAME, "ProgramCounter");
+    snprintf(mem->words[proc->pcb_start + 3].value, MAX_VALUE, "%d", proc->pcb.program_counter);
+    snprintf(mem->words[proc->pcb_start + 4].name, MAX_NAME, "MemoryBoundaries");
+    snprintf(mem->words[proc->pcb_start + 4].value, MAX_VALUE, "%d-%d", proc->pcb.memory_lower, proc->pcb.memory_upper);
+
+    for (int i = 0; i < VAR_COUNT; i++) {
+        mem->words[proc->variable_start + i].name[0] = '\0';
+        mem->words[proc->variable_start + i].value[0] = '\0';
+    }
+
+    mem->next_free += total_size;
+    return 0;
+}
+
+// Load instructions
+int load_instructions(Memory* mem, Process* proc, const char* filename) {
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        printf("Error: Could not open file %s\n", filename);
+        return -1;
+    }
+
+    char line[MAX_LINE_LENGTH];
+    int count = 0;
+    int addr = proc->instruction_start;
+    while (fgets(line, MAX_LINE_LENGTH, file) && count < MAX_INSTRUCTIONS) {
+        line[strcspn(line, "\n")] = 0;
+        if (addr > proc->pcb.memory_upper) {
+            printf("Error: Instruction count exceeds allocated memory\n");
+            fclose(file);
+            return -1;
+        }
+        snprintf(mem->words[addr].name, MAX_NAME, "Instruction%d", count);
+        snprintf(mem->words[addr].value, MAX_VALUE, "%s", line);
+        addr++;
+        count++;
+    }
+    fclose(file);
+    return count;
+}
+
+// Build process
+Process* build_process(Memory* mem, int pid, const char* filename) {
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        printf("Error: Could not open file %s\n", filename);
+        return NULL;
+    }
+    int instruction_count = 0;
+    char line[MAX_LINE_LENGTH];
+    while (fgets(line, MAX_LINE_LENGTH, file)) {
+        instruction_count++;
+    }
+    fclose(file);
+
+    Process* proc = (Process*)malloc(sizeof(Process));
+    proc->pcb.process_id = pid;
+    proc->pcb.state = READY;
+    proc->pcb.priority = 1;
+    proc->pcb.program_counter = 0;
+    proc->quantum_used = 0;
+    proc->remaining_time = 0;
+
+    if (allocate_memory(mem, proc, instruction_count) != 0) {
+        free(proc);
+        return NULL;
+    }
+
+    int loaded = load_instructions(mem, proc, filename);
+    if (loaded < 0) {
+        for (int i = proc->pcb.memory_lower; i <= proc->pcb.memory_upper; i++) {
+            mem->words[i].name[0] = '\0';
+            mem->words[i].value[0] = '\0';
+        }
+        free(proc);
+        return NULL;
+    }
+    proc->instruction_count = loaded;
+    snprintf(mem->words[proc->pcb_start + 1].value, MAX_VALUE, "Ready");
+    return proc;
+}
+
+// Get variable
+int get_variable(Memory* mem, Process* proc, const char* var_name, char* value) {
+    for (int i = proc->variable_start; i < proc->variable_start + VAR_COUNT; i++) {
+        if (strcmp(mem->words[i].name, var_name) == 0) {
+            strcpy(value, mem->words[i].value);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Set variable
+int set_variable(Memory* mem, Process* proc, const char* var_name, const char* value) {
+    for (int i = proc->variable_start; i < proc->variable_start + VAR_COUNT; i++) {
+        if (strcmp(mem->words[i].name, var_name) == 0 || mem->words[i].name[0] == '\0') {
+            if (!check_boundaries(proc, i)) {
+                printf("Error: Memory access violation\n");
+                return -1;
+            }
+            snprintf(mem->words[i].name, MAX_NAME, "%s", var_name);
+            snprintf(mem->words[i].value, MAX_VALUE, "%s", value);
+            return 1;
+        }
+    }
+    printf("Error: No free variable slots\n");
+    return -1;
+}
+
+// Semaphore wait
+int semWait(Memory* mem, MutexController* mutex_ctrl, Process* proc, int resource) {
+    if (mutex_ctrl->locked[resource]) {
+        printf("Process %d blocked on resource %d\n", proc->pcb.process_id, resource);
+        proc->pcb.state = BLOCKED;
+        snprintf(mem->words[proc->pcb_start + 1].value, MAX_VALUE, "Blocked");
+        if (resource < 3) {
+            enqueue(&mutex_ctrl->blocked_queues[resource], proc);
+        } else {
+            enqueue(&mutex_ctrl->general_blocked, proc);
+        }
+        return -1;
+    }
+
+    mutex_ctrl->locked[resource] = 1;
+    printf("Process %d acquired resource %d\n", proc->pcb.process_id, resource);
+    return 0;
+}
+
+// Semaphore signal
+int semSignal(Memory* mem, MutexController* mutex_ctrl, Process* proc, Queue* ready_queue, int resource) {
+    if (!mutex_ctrl->locked[resource]) {
+        printf("Error: Resource %d is already unlocked\n", resource);
+        return -1;
+    }
+
+    mutex_ctrl->locked[resource] = 0;
+    printf("Process %d released resource %d\n", proc->pcb.process_id, resource);
+
+    Queue* queue = resource < 3 ? &mutex_ctrl->blocked_queues[resource] : &mutex_ctrl->general_blocked;
+    Process* unblocked = dequeue(queue, 1);
+    if (unblocked) {
+        unblocked->pcb.state = READY;
+        snprintf(mem->words[unblocked->pcb_start + 1].value, MAX_VALUE, "Ready");
+        enqueue(ready_queue, unblocked);
+        printf("Process %d unblocked and moved to ready queue\n", unblocked->pcb.process_id);
+    }
+    return 0;
+}
+
+// Execute instruction
+int execute_instruction(Memory* mem, Process* proc, MutexController* mutex_ctrl, Queue* ready_queue) {
+    int pc_addr = proc->pcb_start + 3;
+    if (!check_boundaries(proc, pc_addr)) {
+        printf("Error: PC access violation\n");
+        return -1;
+    }
+    proc->pcb.program_counter = atoi(mem->words[pc_addr].value);
+    if (proc->pcb.program_counter >= proc->instruction_count) {
+        return 0;
+    }
+
+    int instr_addr = proc->instruction_start + proc->pcb.program_counter;
+    if (!check_boundaries(proc, instr_addr)) {
+        printf("Error: Instruction access violation\n");
+        return -1;
+    }
+
+    char* instruction = mem->words[instr_addr].value;
+    char command[20], arg1[MAX_NAME], arg2[MAX_VALUE], arg3[MAX_VALUE];
+    int parsed = sscanf(instruction, "%s %s %s %s", command, arg1, arg2, arg3);
+    
+    printf("Process %d executing: %s\n", proc->pcb.process_id, instruction);
+
+    if (strcmp(command, "assign") == 0) {
+        char value[MAX_VALUE];
+        if (parsed >= 3 && strcmp(arg2, "input") == 0) {
+            printf("Please enter a value: ");
+            scanf("%s", value);
+        }
+        else if (parsed >= 4 && strcmp(arg2, "readFile") == 0) {
+            char filename[MAX_VALUE];
+            if (get_variable(mem, proc, arg3, filename)) {
+            } else {
+                strcpy(filename, arg3);
+            }
+            if (strstr(filename, ".txt") == NULL) {
+                strcat(filename, ".txt");
+            }
+            FILE* file = fopen(filename, "r");
+            if (file) {
+                if (fgets(value, MAX_VALUE, file)) {
+                    value[strcspn(value, "\n")] = 0;
+                } else {
+                    value[0] = '\0';
+                }
+                fclose(file);
+            } else {
+                printf("Error: Could not read file %s\n", filename);
+                value[0] = '\0';
+            }
+        }
+        else {
+            strcpy(value, arg2);
+        }
+
+        if (set_variable(mem, proc, arg1, value) < 0) {
+            return -1;
+        }
+    }
+    else if (strcmp(command, "print") == 0) {
+        char value[MAX_VALUE];
+        if (get_variable(mem, proc, arg1, value)) {
+            printf("%s\n", value);
+        } else {
+            printf("Error: Variable %s not found\n", arg1);
+            return -1;
+        }
+    }
+    else if (strcmp(command, "printFromTo") == 0) {
+        char val1[MAX_VALUE], val2[MAX_VALUE];
+        if (get_variable(mem, proc, arg1, val1) && get_variable(mem, proc, arg2, val2)) {
+            int start = atoi(val1);
+            int end = atoi(val2);
+            for (int i = start; i <= end; i++) {
+                printf("%d ", i);
+            }
+            printf("\n");
+        } else {
+            printf("Error: Invalid variables for printFromTo\n");
+            return -1;
+        }
+    }
+    else if (strcmp(command, "writeFile") == 0) {
+        char value[MAX_VALUE];
+        if (get_variable(mem, proc, arg2, value)) {
+            char filename[MAX_VALUE];
+            if (get_variable(mem, proc, arg1, filename)) {
+            } else {
+                strcpy(filename, arg1);
+            }
+            if (strstr(filename, ".txt") == NULL) {
+                strcat(filename, ".txt");
+            }
+            FILE* file = fopen(filename, "w");
+            if (file) {
+                fprintf(file, "%s", value);
+                fclose(file);
+            } else {
+                printf("Error: Could not write to file %s\n", filename);
+                return -1;
+            }
+        } else {
+            printf("Error: Variable %s not found\n", arg2);
+            return -1;
+        }
+    }
+    else if (strcmp(command, "readFile") == 0) {
+        char filename[MAX_VALUE];
+        if (get_variable(mem, proc, arg1, filename)) {
+        } else {
+            strcpy(filename, arg1);
+        }
+        if (strstr(filename, ".txt") == NULL) {
+            strcat(filename, ".txt");
+        }
+        FILE* file = fopen(filename, "r");
+        if (file) {
+            char buffer[MAX_VALUE];
+            if (fgets(buffer, MAX_VALUE, file)) {
+                buffer[strcspn(buffer, "\n")] = 0;
+                printf("%s\n", buffer);
+            }
+            fclose(file);
+        } else {
+            printf("Error: Could not read file %s\n", filename);
+            return -1;
+        }
+    }
+    else if (strcmp(command, "semWait") == 0) {
+        int resource = strcmp(arg1, "userInput") == 0 ? 0 : 
+                       strcmp(arg1, "userOutput") == 0 ? 1 : 
+                       strcmp(arg1, "file") == 0 ? 2 : atoi(arg1);
+        if (semWait(mem, mutex_ctrl, proc, resource) < 0) {
+            return -1;
+        }
+    }
+    else if (strcmp(command, "semSignal") == 0) {
+        int resource = strcmp(arg1, "userInput") == 0 ? 0 : 
+                       strcmp(arg1, "userOutput") == 0 ? 1 : 
+                       strcmp(arg1, "file") == 0 ? 2 : atoi(arg1);
+        if (semSignal(mem, mutex_ctrl, proc, ready_queue, resource) < 0) {
+            return -1;
+        }
+    }
+    else {
+        printf("Error: Unknown command %s\n", command);
+        return -1;
+    }
+
+    proc->pcb.program_counter++;
+    snprintf(mem->words[pc_addr].value, MAX_VALUE, "%d", proc->pcb.program_counter);
+    proc->quantum_used++;
+    return 1;
+}
+
+// Free process
+void free_process(Memory* mem, Process* proc) {
+    for (int i = proc->pcb.memory_lower; i <= proc->pcb.memory_upper; i++) {
+        mem->words[i].name[0] = '\0';
+        mem->words[i].value[0] = '\0';
+    }
+    free(proc);
+}
+
+// Initialize simulation engine
+void init_simulation(SimulationEngine* engine, Memory* memory, MutexController* mutex_ctrl, 
+                    Process** processes, int process_count, int algorithm, int quantum) {
+    engine->memory = memory;
+    engine->mutex_ctrl = mutex_ctrl;
+    engine->processes = processes;
+    engine->process_count = process_count;
+    engine->algorithm = algorithm;
+    engine->quantum = quantum;
+    engine->clock_cycle = 0;
+    engine->completed_processes = 0;
+
+    for (int i = 0; i < 4; i++) {
+        init_queue(&engine->ready_queues[i]);
+    }
+    for (int i = 0; i < process_count; i++) {
+        enqueue(&engine->ready_queues[algorithm == 2 ? processes[i]->pcb.priority - 1 : 0], processes[i]);
+    }
+}
+
+// Log execution details
+void log_cycle(SimulationEngine* engine, Process* current_proc, const char* instruction, int result) {
+    printf("\n=== Clock Cycle %d ===\n", engine->clock_cycle);
+    if (current_proc) {
+        printf("Current Process: PID %d (Priority: %d, State: %s, PC: %d)\n", 
+               current_proc->pcb.process_id, current_proc->pcb.priority, 
+               current_proc->pcb.state == READY ? "Ready" :
+               current_proc->pcb.state == RUNNING ? "Running" :
+               current_proc->pcb.state == BLOCKED ? "Blocked" : "Terminated",
+               current_proc->pcb.program_counter);
+        if (instruction) {
+            printf("Instruction: %s\n", instruction);
+            printf("Execution Result: %s\n", 
+                   result == 1 ? "Success" : 
+                   result == 0 ? "Process Completed" : "Blocked/Error");
+        }
+    } else {
+        printf("No process selected (all queues empty or all processes completed).\n");
+    }
+
+    printf("Ready Queue(s):\n");
+    for (int i = 0; i < (engine->algorithm == 2 ? 4 : 1); i++) {
+        printf("  Queue %d: ", i);
+        QueueNode* node = engine->ready_queues[i].front;
+        if (!node) {
+            printf("Empty");
+        }
+        while (node) {
+            printf("PID %d ", node->process->pcb.process_id);
+            node = node->next;
+        }
+        printf("\n");
+    }
+
+    printf("Blocked Queues:\n");
+    for (int i = 0; i < MAX_MUTEXES; i++) {
+        if (engine->mutex_ctrl->locked[i]) {
+            printf("  Resource %d (Locked): ", i);
+            QueueNode* node = engine->mutex_ctrl->blocked_queues[i].front;
+            if (!node) {
+                printf("Empty");
+            }
+            while (node) {
+                printf("PID %d ", node->process->pcb.process_id);
+                node = node->next;
+            }
+            printf("\n");
+        }
+    }
+    printf("  General Blocked: ");
+    QueueNode* gnode = engine->mutex_ctrl->general_blocked.front;
+    if (!gnode) {
+        printf("Empty");
+    }
+    while (gnode) {
+        printf("PID %d ", gnode->process->pcb.process_id);
+        gnode = gnode->next;
+    }
+    printf("\n");
+
+    if (current_proc) {
+        printf("Memory (Variables for PID %d):\n", current_proc->pcb.process_id);
+        for (int i = current_proc->variable_start; i < current_proc->variable_start + VAR_COUNT; i++) {
+            if (engine->memory->words[i].name[0] != '\0') {
+                printf("  %s = %s\n", engine->memory->words[i].name, engine->memory->words[i].value);
+            }
+        }
+    }
+}
+
+// Select next process
+Process* select_next_process(SimulationEngine* engine) {
+    Process* proc = NULL;
+    int queue_index = 0;
+
+    if (engine->algorithm == 2) {
+        for (int i = 0; i < 4; i++) {
+            if (engine->ready_queues[i].front) {
+                proc = dequeue(&engine->ready_queues[i], 0);
+                queue_index = i;
+                break;
+            }
+        }
+    } else {
+        proc = dequeue(&engine->ready_queues[0], 0);
+    }
+
+    if (proc) {
+        proc->pcb.state = RUNNING;
+        snprintf(engine->memory->words[proc->pcb_start + 1].value, MAX_VALUE, "Running");
+        proc->quantum_used = 0;
+    }
+    return proc;
+}
+
+// Execute one cycle
+int execute_cycle(SimulationEngine* engine, Process* current_proc) {
+    printf("Cycle %d: Starting with PID %d\n", engine->clock_cycle, current_proc ? current_proc->pcb.process_id : -1);
+    if (!current_proc) {
+        printf("No process to execute\n");
+        log_cycle(engine, NULL, NULL, -1);
+        return 0;
+    }
+    int max_quantum = engine->algorithm == 2 ? (1 << (current_proc->pcb.priority - 1)) : engine->quantum;
+    printf("PID %d, max_quantum: %d, quantum_used: %d\n", current_proc->pcb.process_id, max_quantum, current_proc->quantum_used);
+
+    // Execute up to max_quantum instructions in this scheduling turn
+    int instructions_executed = 0;
+    int result = 1;
+    while (instructions_executed < max_quantum && 
+           result == 1 && 
+           current_proc->pcb.program_counter < current_proc->instruction_count) {
+        int instr_addr = current_proc->instruction_start + current_proc->pcb.program_counter;
+        char* instruction = current_proc->pcb.program_counter < current_proc->instruction_count ?
+                            engine->memory->words[instr_addr].value : NULL;
+        printf("Executing instruction %d of %d for PID %d: %s\n", 
+               instructions_executed + 1, max_quantum, current_proc->pcb.process_id, instruction);
+        result = execute_instruction(engine->memory, current_proc, engine->mutex_ctrl, 
+                                   &engine->ready_queues[engine->algorithm == 2 ? 
+                                   current_proc->pcb.priority - 1 : 0]);
+        printf("Instruction result: %d, quantum_used: %d\n", result, current_proc->quantum_used);
+        log_cycle(engine, current_proc, instruction, result);
+        instructions_executed++;
+        if (result != 1) break; // Stop if blocked (-1) or terminated (0)
+    }
+
+    if (result == -1) {
+        printf("PID %d blocked\n", current_proc->pcb.process_id);
+        return 1;
+    }
+    if (result == 0) {
+        printf("PID %d terminated\n", current_proc->pcb.process_id);
+        current_proc->pcb.state = TERMINATED;
+        snprintf(engine->memory->words[current_proc->pcb_start + 1].value, MAX_VALUE, "Terminated");
+        engine->completed_processes++;
+        free_process(engine->memory, current_proc);
+        return 1;
+    }
+    if (instructions_executed >= max_quantum) {
+        printf("Quantum expired for PID %d\n", current_proc->pcb.process_id);
+        current_proc->pcb.state = READY;
+        snprintf(engine->memory->words[current_proc->pcb_start + 1].value, MAX_VALUE, "Ready");
+        if (engine->algorithm == 2 && current_proc->pcb.priority < 4) {
+            current_proc->pcb.priority++;
+            snprintf(engine->memory->words[current_proc->pcb_start + 2].value, MAX_VALUE, "%d", current_proc->pcb.priority);
+        }
+        enqueue(&engine->ready_queues[engine->algorithm == 2 ? current_proc->pcb.priority - 1 : 0], current_proc);
+    }
+    engine->clock_cycle++; // Increment cycle after all instructions
+    return 1;
+}
+// Step-by-step mode
+void run_step_by_step(SimulationEngine* engine) {
+    printf("Step-by-step mode. Press Enter to advance cycle, 'q' to quit.\n");
+    while (engine->completed_processes < engine->process_count) {
+        Process* current_proc = select_next_process(engine);
+        if (!current_proc && engine->completed_processes < engine->process_count) {
+            printf("No ready processes (possible deadlock). Press Enter to continue, 'q' to quit.\n");
+        }
+        int cont = execute_cycle(engine, current_proc);
+        if (!cont) break;
+
+        char input;
+        do {
+            input = getchar();
+            if (input == 'q' || input == 'Q') return;
+        } while (input != '\n');
+    }
+    printf("Simulation complete: All processes terminated.\n");
+}
+
+// Auto-run mode
+void run_auto(SimulationEngine* engine) {
+    printf("Auto-run mode. Press Ctrl+C to interrupt.\n");
+    while (engine->completed_processes < engine->process_count) {
+        Process* current_proc = select_next_process(engine);
+        if (!current_proc && engine->completed_processes < engine->process_count) {
+            printf("No ready processes (possible deadlock). Stopping.\n");
+            break;
+        }
+        if (!execute_cycle(engine, current_proc)) break;
+        engine->clock_cycle++;
+    }
+    printf("Simulation complete: All processes terminated.\n");
+}
+
+// Main function
+int main() {
+    Memory memory;
+    init_memory(&memory);
+    MutexController mutex_ctrl;
+    init_mutex(&mutex_ctrl);
+
+    Process* p1 = build_process(&memory, 1, "/home/mohamed/HelloWorld/Program_1.txt");
+    Process* p2 = build_process(&memory, 2, "/home/mohamed/HelloWorld/Program_2.txt");
+    Process* p3 = build_process(&memory, 3, "/home/mohamed/HelloWorld/Program_3.txt");
+
+    if (!p1 || !p2 || !p3) {
+        printf("Failed to load all processes.\n");
+        return 1;
+    }
+
+    Process* processes[] = {p1, p2, p3};
+    int process_count = 3;
+
+    SimulationEngine engine;
+    int algorithm, quantum;
+
+    printf("Select scheduling algorithm (0: FCFS, 1: RR, 2: MLFQ): ");
+    scanf("%d", &algorithm);
+    if (algorithm < 0 || algorithm > 2) {
+        printf("Invalid algorithm. Defaulting to FCFS.\n");
+        algorithm = 0;
+    }
+    if (algorithm == 1) {
+        printf("Enter quantum time for Round Robin: ");
+        scanf("%d", &quantum);
+    } else {
+        quantum = algorithm == 2 ? 1 : 0;
+    }
+
+    init_simulation(&engine, &memory, &mutex_ctrl, processes, process_count, algorithm, quantum);
+
+    char mode;
+    printf("Select mode (s: Step-by-step, a: Auto-run): ");
+    scanf(" %c", &mode);
+    mode = tolower(mode);
+
+    if (mode == 's') {
+        run_step_by_step(&engine);
+    } else if (mode == 'a') {
+        run_auto(&engine);
+    } else {
+        printf("Invalid mode. Exiting.\n");
+        return 1;
+    }
+
+    return 0;
+}
+
+
+
+
+
+/*
+int main() {
+    Memory memory;
+    init_memory(&memory);
+    MutexController mutex_ctrl;
+    init_mutex(&mutex_ctrl);
+
+    // Load processes
+    Process* p1 = build_process(&memory, 1, "/home/mohamed/HelloWorld/Program_1.txt");
+    Process* p2 = build_process(&memory, 2, "/home/mohamed/HelloWorld/Program_2.txt");
+    Process* p3 = build_process(&memory, 3, "/home/mohamed/HelloWorld/Program_3.txt");
+
+    if (!p1 || !p2 || !p3) {
+        printf("Failed to load all processes.\n");
+        return 1;
+    }
+
+    Process* processes[] = {p1, p2, p3};
+    int process_count = 3;
+
+    int quantum;
+    printf("Enter quantum time for Round Robin: ");
+    scanf("%d", &quantum);
+
+    printf("\n--- Running Round Robin Scheduler ---\n");
+    schedule(&memory, processes, process_count, &mutex_ctrl, 1, quantum); // Round Robin = algorithm 1
+
+    return 0;
+}*/
+/*
+int main() {
+    Memory memory;
+    init_memory(&memory); // Initialize memory system
+
+    MutexController mutex_ctrl;
+    init_mutex(&mutex_ctrl); // Initialize mutex controller
+
+    // Load processes from file paths
+    Process* p1 = build_process(&memory, 1, "/home/mohamed/HelloWorld/Program_1.txt");
+    Process* p2 = build_process(&memory, 2, "/home/mohamed/HelloWorld/Program_2.txt");
+    Process* p3 = build_process(&memory, 3, "/home/mohamed/HelloWorld/Program_3.txt");
+
+    // Check if all processes loaded successfully
+    if (!p1 || !p2 || !p3) {
+        printf("Failed to load all processes.\n");
+        return 1;
+    }
+
+    // Create an array of processes
+    Process* processes[] = {p1, p2, p3};
+    int process_count = 3;
+
+    // Set MLFQ parameters
+    int quantum = 1;
+
+    printf("\n--- Running MLFQ Scheduler ---\n");
+
+    // Run MLFQ scheduler (algorithm 2) with quantum 2
+    schedule(&memory, processes, process_count, &mutex_ctrl, 2, quantum);
+
+    return 0;
+}
+*/
